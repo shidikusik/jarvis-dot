@@ -113,56 +113,288 @@ class Listener(QThread):
     failed = Signal(str)
     level = Signal(float)
 
-    def __init__(self, model_path: Path, microphone, speaking: threading.Event):
+    def __init__(self, model_path: Path, microphone, speaking: threading.Event,
+                 settings=None, cloud_transcriber=None):
         super().__init__()
         self.model_path, self.microphone, self.speaking = model_path, microphone, speaking
+        self.settings = dict(settings or {})
+        self.cloud_transcriber = cloud_transcriber
         self.stop_event = threading.Event()
         self.suspended = threading.Event()
+        self.transcribing = threading.Event()
 
     def stop(self):
         self.stop_event.set()
 
+    def _trusted_text(self, result):
+        """No low-confidence or unknown local guesses become executable text."""
+        text = result.get("text", "").strip()
+        words = result.get("result", [])
+        if not text or "[unk]" in text or not words:
+            return ""
+        confidence = [float(word.get("conf", 0)) for word in words]
+        threshold = float(self.settings.get("min_recognition_confidence", .72))
+        if (not all(math.isfinite(value) for value in confidence)
+                or min(confidence) < .40
+                or sum(confidence) / len(confidence) < threshold):
+            return ""
+        return text
+
+    def _wake_is_confident(self, result):
+        from jarvis.commands import normalize
+        wake = normalize(self.settings.get("wake_word", "джарвис"))
+        text = normalize(result.get("text", ""))
+        words = result.get("result", [])
+        prefix = wake.split()
+        if not prefix or not (text == wake or text.startswith(wake + " ")):
+            return False
+        if len(words) < len(prefix):
+            return False
+        threshold = float(self.settings.get("min_recognition_confidence", .72))
+        for expected, actual in zip(prefix, words):
+            confidence = float(actual.get("conf", 0))
+            if (normalize(actual.get("word", "")) != expected
+                    or not math.isfinite(confidence) or confidence < threshold):
+                return False
+        return True
+
+    def _finish_utterance(self, pcm, sample_rate, result, wake_result=None, verification_result=None):
+        from jarvis.commands import normalize
+        if self.stop_event.is_set() or self.suspended.is_set() or self.speaking.is_set():
+            return
+        use_cloud = (self.cloud_transcriber is not None
+                     and self.settings.get("recognition_backend", "offline") == "gemini")
+        # The local opt-out is useful for push-to-talk/offline commands. Cloud
+        # requests always require an explicitly addressed, confident local wake.
+        require_wake = use_cloud or self.settings.get("require_wake_word", True)
+        acoustic_result = wake_result if wake_result is not None else result
+        cancelled = {"не", "нет", "отмена", "отмени", "стоп"}
+        transcripts = [result, acoustic_result, verification_result or {}]
+        if any(cancelled.intersection(normalize(r.get("text", "")).split()) for r in transcripts):
+            self.state.emit("Команда отменена.")
+            return
+        wake_valid = self._wake_is_confident(wake_result if wake_result is not None else result)
+        if require_wake and not wake_valid:
+            return
+        local_text = self._trusted_text(result)
+        if use_cloud:
+            self.transcribing.set()
+            self.state.emit("Распознаю команду онлайн…")
+            try:
+                # Audio stays local until its locally recognized wake prefix is
+                # confident, including when offline wake gating is disabled.
+                completed = threading.Event()
+                outcome = {}
+
+                def request():
+                    try:
+                        outcome["text"] = self.cloud_transcriber(pcm, sample_rate, result.get("text", ""))
+                    except Exception:
+                        outcome["failed"] = True
+                    finally:
+                        completed.set()
+
+                threading.Thread(target=request, daemon=True).start()
+                deadline = time.monotonic() + 35
+                while not completed.wait(.05):
+                    if self.stop_event.is_set() or self.suspended.is_set() or self.speaking.is_set():
+                        return
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("Cloud recognition timed out")
+                if outcome.get("failed"):
+                    raise RuntimeError("Cloud recognition unavailable")
+                text = outcome.get("text", "")
+                if self.stop_event.is_set() or self.suspended.is_set() or self.speaking.is_set():
+                    return
+                if not isinstance(text, str) or not text.strip():
+                    self.state.emit("Не разобрал команду. Повторите ближе к микрофону.")
+                    return
+                text = normalize(text[:1000])
+                if require_wake:
+                    wake = normalize(self.settings.get("wake_word", "джарвис"))
+                    if text != wake and not text.startswith(wake + " "):
+                        text = wake + " " + text
+                self.recognized.emit(text)
+                return
+            except Exception:
+                # Provider errors can contain URLs or credentials. Emit a fixed
+                # status and preserve safe offline command execution instead.
+                self.state.emit("Онлайн-распознавание недоступно. Использую локальное.")
+            finally:
+                self.transcribing.clear()
+        if local_text:
+            self.recognized.emit(local_text)
+        else:
+            self.state.emit("Не разобрал команду. Повторите ближе к микрофону.")
+
+    def _grammar(self):
+        from jarvis.commands import defaults, normalize
+        wake = normalize(self.settings.get("wake_word", "джарвис"))
+        phrases = self.settings.get("command_phrases")
+        if phrases is None:
+            phrases = [p for command in defaults() for p in command["phrases"]]
+        phrases = [normalize(p) for p in phrases if isinstance(p, str) and normalize(p)]
+        # [unk] gives unrelated speech a rejection path, instead of forcing it
+        # into one of the configured commands. Connectors retain chained actions.
+        grammar = ["[unk]", "и затем", "затем", "и", "не", "нет", "отмена", "отмени", "стоп", "не надо"]
+        if wake:
+            grammar.append(wake)
+        for phrase in phrases:
+            grammar.append(phrase)
+            if wake:
+                grammar.append(wake + " " + phrase)
+        return json.dumps(list(dict.fromkeys(grammar)), ensure_ascii=False)
+
     def run(self):
         try:
+            import numpy as np
             import sounddevice as sd
             from vosk import Model, KaldiRecognizer, SetLogLevel
+            from jarvis.audio_gate import SpeechGate
             SetLogLevel(-1)
             self.state.emit("Загружаю локальную модель…")
             model = Model(str(self.model_path))
             device = sd.query_devices(self.microphone, "input")
-            sample_rate = int(device["default_samplerate"])
-            recognizer = KaldiRecognizer(model, sample_rate)
-            audio = queue.Queue(maxsize=30)
+            capture_rate = 16000
+            try:
+                sd.check_input_settings(device=self.microphone, channels=1,
+                                        dtype="int16", samplerate=capture_rate)
+            except (sd.PortAudioError, ValueError):
+                capture_rate = int(device["default_samplerate"])
+                sd.check_input_settings(device=self.microphone, channels=1,
+                                        dtype="int16", samplerate=capture_rate)
+            sample_rate = 16000
+            use_cloud = (self.cloud_transcriber is not None
+                         and self.settings.get("recognition_backend", "offline") == "gemini")
+            # Free-form decoding is necessary for a trustworthy cloud wake gate.
+            # Command grammar improves the much smaller offline command domain.
+            if use_cloud:
+                recognizer = KaldiRecognizer(model, sample_rate)
+            else:
+                try:
+                    recognizer = KaldiRecognizer(model, sample_rate, self._grammar())
+                except Exception:
+                    self.state.emit("Модель без словаря команд. Использую обычное локальное распознавание.")
+                    recognizer = KaldiRecognizer(model, sample_rate)
+            recognizer.SetWords(True)
+            # A constrained decoder may discard unknown words before the wake
+            # name. Independently verify the true beginning of addressed offline
+            # phrases with the complete vocabulary before accepting its command.
+            wake_verifier = None
+            if not use_cloud:
+                wake_verifier = KaldiRecognizer(model, sample_rate)
+                wake_verifier.SetWords(True)
+            safety_verifier = None
+            if use_cloud:
+                try:
+                    safety_verifier = KaldiRecognizer(model, sample_rate, self._grammar())
+                    safety_verifier.SetWords(True)
+                except Exception:
+                    pass
+            gate = SpeechGate(sample_rate, threshold=self.settings.get("speech_threshold", .004))
+            audio = queue.Queue(maxsize=50)
+            overrun = threading.Event()
+            paused_capture = threading.Event()
 
             def callback(data, frames, timing, status):
-                if self.stop_event.is_set():
+                if (self.stop_event.is_set() or self.speaking.is_set()
+                        or self.suspended.is_set() or self.transcribing.is_set()
+                        or paused_capture.is_set()):
                     return
+                if status:
+                    overrun.set()
                 try:
                     audio.put_nowait(bytes(data))
                 except queue.Full:
-                    pass
+                    overrun.set()
 
-            with sd.RawInputStream(samplerate=sample_rate, blocksize=int(sample_rate * .12),
+            results = []
+            pause_was_active = False
+            resume_after = 0.
+            partial_after = 0.
+
+            def reset_capture():
+                gate.reset()
+                recognizer.Reset()
+                results.clear()
+                while True:
+                    try:
+                        audio.get_nowait()
+                    except queue.Empty:
+                        break
+                self.partial.emit("")
+
+            with sd.RawInputStream(samplerate=capture_rate, blocksize=int(capture_rate * .02),
                     dtype="int16", channels=1, device=self.microphone, callback=callback):
-                self.state.emit("Слушаю. Скажите «Джарвис» и команду")
+                wake = self.settings.get("wake_word", "джарвис")
+                self.state.emit(f"Слушаю. Скажите «{wake.capitalize()}» и команду" if self.settings.get("require_wake_word", True) else "Слушаю команду.")
                 while not self.stop_event.is_set():
+                    paused = self.speaking.is_set() or self.suspended.is_set()
+                    if paused:
+                        if not pause_was_active:
+                            reset_capture()
+                            self.level.emit(0)
+                        pause_was_active = True
+                        self.stop_event.wait(.03)
+                        continue
+                    if pause_was_active:
+                        reset_capture()
+                        resume_after = time.monotonic() + .35
+                        pause_was_active = False
+                    if overrun.is_set():
+                        overrun.clear()
+                        reset_capture()
+                        self.state.emit("Пропуск аудио. Повторите команду.")
                     try:
                         data = audio.get(timeout=.2)
                     except queue.Empty:
                         continue
-                    if self.speaking.is_set() or self.suspended.is_set():
-                        recognizer.Reset()
-                        self.level.emit(0)
+                    if time.monotonic() < resume_after:
                         continue
-                    samples = struct.unpack(f"<{len(data)//2}h", data)
-                    rms = math.sqrt(sum(x*x for x in samples) / max(1, len(samples))) / 32768
-                    self.level.emit(min(1, rms * 9))
-                    if recognizer.AcceptWaveform(data):
-                        text = json.loads(recognizer.Result()).get("text", "")
-                        if text:
-                            self.recognized.emit(text)
-                    else:
-                        self.partial.emit(json.loads(recognizer.PartialResult()).get("partial", ""))
+                    if capture_rate != sample_rate:
+                        samples = np.frombuffer(data, dtype="<i2")
+                        count = round(len(samples) * sample_rate / capture_rate)
+                        positions = np.arange(count) * capture_rate / sample_rate
+                        data = np.interp(positions, np.arange(len(samples)), samples).astype("<i2").tobytes()
+                    for event in gate.feed(data):
+                        self.level.emit(event.level)
+                        if event.started:
+                            recognizer.Reset()
+                            results.clear()
+                        if event.rejected:
+                            recognizer.Reset()
+                            results.clear()
+                            self.partial.emit("")
+                            continue
+                        if event.audio:
+                            if recognizer.AcceptWaveform(event.audio):
+                                results.append(json.loads(recognizer.Result()))
+                            elif time.monotonic() >= partial_after:
+                                partial_after = time.monotonic() + .15
+                                self.partial.emit(json.loads(recognizer.PartialResult()).get("partial", ""))
+                        if event.utterance is not None:
+                            results.append(json.loads(recognizer.FinalResult()))
+                            result = {"text": " ".join(r.get("text", "") for r in results).strip(),
+                                      "result": [word for r in results for word in r.get("result", [])]}
+                            paused_capture.set()
+                            try:
+                                wake_result = None
+                                if wake_verifier is not None and self._trusted_text(result):
+                                    wake_verifier.Reset()
+                                    wake_verifier.AcceptWaveform(event.utterance)
+                                    wake_result = json.loads(wake_verifier.FinalResult())
+                                verification_result = None
+                                if safety_verifier is not None and self._wake_is_confident(result):
+                                    safety_verifier.Reset()
+                                    safety_verifier.AcceptWaveform(event.utterance)
+                                    verification_result = json.loads(safety_verifier.FinalResult())
+                                self._finish_utterance(event.utterance, sample_rate, result, wake_result,
+                                                       verification_result)
+                            finally:
+                                reset_capture()
+                                resume_after = time.monotonic() + .15
+                                paused_capture.clear()
+                            break
         except Exception as exc:
             self.failed.emit(f"Микрофон / распознавание: {exc}")
         finally:

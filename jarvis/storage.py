@@ -26,6 +26,9 @@ DEFAULT_SETTINGS = {
     "accent": "#d9e7a5",
     "model_path": "",
     "microphone": None,
+    "recognition_backend": "offline",
+    "speech_threshold": 0.004,
+    "min_recognition_confidence": 0.72,
     "close_to_tray": True,
 }
 

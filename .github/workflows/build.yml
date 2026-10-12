@@ -28,11 +28,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libportaudio2 espeak-ng libespeak1 libegl1 libgl1 libxcb-cursor0 libxkbcommon-x11-0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-render-util0 libxcb-xinput0 libxcb-shape0 libxcb-xfixes0 libxcb-randr0 libxcb-sync1 xvfb
       - run: python -m pip install -r requirements-dev.txt
-      - run: python -m pytest -q
       - name: Download verified offline model
         run: |
           python scripts/download_model.py
           python scripts/download_voices.py
+      - name: Unit and real acoustic checks
+        run: python -m pytest -q
       - name: Offline speech and recognition check
         run: python scripts/check_speech.py
       - name: Source GUI smoke test (Windows)
@@ -87,4 +88,4 @@ jobs:
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          gh release create "$RELEASE_TAG" release/* --title "JARVIS DOT $RELEASE_TAG" --notes "Native offline voice assistant for Windows and Linux. Russian speech model included. Extract the full archive and run JarvisDot.exe on Windows or start.sh on Linux. See README for Linux runtime dependencies and supported platforms." --verify-tag
+          gh release create "$RELEASE_TAG" release/* --title "JARVIS DOT $RELEASE_TAG" --notes "Native assistant for Windows and Linux. Offline Russian speech models included; optional Google Gemini recognition with your own free-tier key. Improved speech/noise filtering and wake-word validation. Extract the full archive and run JarvisDot.exe on Windows or start.sh on Linux. See README for privacy, quota, and platform details." --verify-tag

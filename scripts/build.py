@@ -15,10 +15,14 @@ from jarvis.models import MODEL_NAME, valid_model
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--with-model", action="store_true")
+    parser.add_argument("--output-dir", type=Path, default=ROOT / "dist",
+                        help="Separate build destination, useful while an older app is running")
     args = parser.parse_args()
+    destination = args.output_dir.resolve()
     command = [sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "--windowed",
                "--name", "JarvisDot", "--paths", str(ROOT), "--collect-all", "vosk",
                "--collect-all", "sounddevice", "--collect-submodules", "pyttsx3.drivers"]
+    command += ["--distpath", str(destination), "--additional-hooks-dir", str(ROOT / "scripts/pyinstaller_hooks")]
     if sys.platform == "win32":
         command += ["--icon", str(ROOT/"assets/app.ico")]
     if args.with_model:
@@ -33,7 +37,7 @@ def main():
     command += [str(ROOT / "run.py")]
     command += ["--add-data", f"{ROOT / 'assets'}:assets", "--add-data", f"{ROOT / 'scripts/clone_voice.py'}:scripts"]
     subprocess.run(command, cwd=ROOT, check=True)
-    bundle = ROOT / "dist/JarvisDot"
+    bundle = destination / "JarvisDot"
     if sys.platform == "win32":
         # Qt 6.12 imports Windows' unversioned ICU API. A Git installation on PATH
         # can make PyInstaller collect ICU 78 with incompatible suffixed exports.
@@ -44,7 +48,7 @@ def main():
     shutil.copy2(ROOT / "LICENSE", bundle / "LICENSE")
     shutil.copy2(ROOT / "THIRD_PARTY.md", bundle / "THIRD_PARTY.md")
     if sys.platform == "win32":
-        archive = ROOT / "dist/JarvisDot-Windows-x64.zip"
+        archive = destination / "JarvisDot-Windows-x64.zip"
         with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as z:
             for path in bundle.rglob("*"):
                 if path.is_file():
@@ -53,7 +57,7 @@ def main():
         launcher = bundle / "start.sh"
         launcher.write_text('#!/bin/sh\ncd -- "$(dirname -- "$0")" || exit 1\nexec ./JarvisDot "$@"\n', encoding="utf-8")
         launcher.chmod(0o755)
-        archive = ROOT / "dist/JarvisDot-Linux-x64.tar.gz"
+        archive = destination / "JarvisDot-Linux-x64.tar.gz"
         with tarfile.open(archive, "w:gz") as tar:
             tar.add(bundle, arcname="JarvisDot")
     print(archive)

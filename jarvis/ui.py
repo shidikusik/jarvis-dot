@@ -9,13 +9,17 @@ import sys
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout,
+    QApplication, QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFormLayout,
     QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
     QMenu, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea,
-    QStackedWidget, QSystemTrayIcon, QVBoxLayout, QWidget,
+    QSpinBox, QStackedWidget, QSystemTrayIcon, QVBoxLayout, QWidget,
 )
 
+from jarvis import __version__
+from jarvis.cloud import GeminiCommandRecognizer
 from jarvis.commands import defaults, match_phrase, validate_collection, validate_command
+from jarvis.credentials import (CredentialsError, delete_gemini_key,
+    has_gemini_key, load_gemini_key, save_gemini_key)
 from jarvis.models import find_model
 from jarvis.platform_actions import Executor
 from jarvis.storage import Store
@@ -223,9 +227,11 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.store = store or Store()
         self.settings = self.store.settings()
+        self._offline_require_wake = self.settings["require_wake_word"]
         self.commands = validate_collection(self.store.read("commands.json", defaults()))
         self.test_mode = test_mode
         self.listener = self.runner = self.downloader = None
+        self._cloud_recognizer = None
         self._quitting = False
         self.pending_phrase = ""
         self.speaker = Speaker(self.speech_error.emit, self.speech_state.emit)
@@ -233,7 +239,7 @@ class MainWindow(QMainWindow):
         self.speaker.mode = self.settings["voice_mode"]
         self.configure_speaker()
         self.executor = Executor(self.store.root, self.speaker.say)
-        self.setWindowTitle("JARVIS DOT · Offline assistant")
+        self.setWindowTitle("JARVIS DOT · Desktop assistant")
         self.resize(1180, 820)
         self.setMinimumSize(980, 720)
         self.make_icon()
@@ -246,6 +252,7 @@ class MainWindow(QMainWindow):
         self.refresh_commands()
         self.refresh_history()
         self.refresh_model()
+        self.refresh_recognition_status()
 
     def make_icon(self):
         pixmap = QPixmap(64, 64)
@@ -273,7 +280,7 @@ class MainWindow(QMainWindow):
         side.setContentsMargins(24, 34, 20, 26)
         self.brand = label("JARVIS", "brand")
         side.addWidget(self.brand)
-        side.addWidget(label("D O T  /  0 1", "eyebrow"))
+        side.addWidget(label("D O T  /  0 2", "eyebrow"))
         side.addSpacing(40)
         self.nav = []
         for i, text in enumerate(["◉   Ассистент", "▦   Команды", "≡   История", "⚙   Настройки"]):
@@ -285,7 +292,7 @@ class MainWindow(QMainWindow):
         side.addWidget(label("●  LOCAL FIRST", "online"))
         side.addWidget(label("Твой голос.\nТвой компьютер.\nТвои правила.", "muted", True))
         side.addSpacing(18)
-        side.addWidget(label("WINDOWS + LINUX\nv0.1.0 · независимый", "tiny"))
+        side.addWidget(label(f"WINDOWS + LINUX\nv{__version__} · независимый", "tiny"))
         shell.addWidget(sidebar)
         container = QWidget()
         main = QVBoxLayout(container)
@@ -301,7 +308,8 @@ class MainWindow(QMainWindow):
         self.persona_switch.setCurrentIndex(max(0, self.persona_switch.findData(self.settings["voice_mode"])))
         self.persona_switch.currentIndexChanged.connect(lambda: self.switch_persona(self.persona_switch.currentData()))
         header.addWidget(self.persona_switch)
-        header.addWidget(label("●  ОФЛАЙН", "chip"))
+        self.recognition_chip = label("●  ОФЛАЙН", "chip")
+        header.addWidget(self.recognition_chip)
         main.addLayout(header)
         self.pages = QStackedWidget()
         main.addWidget(self.pages, 1)
@@ -323,7 +331,8 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.hero_eyebrow)
         self.hero_title = label("Твой ПК.\nПод твоим голосом.", "heroTitle")
         layout.addWidget(self.hero_title)
-        layout.addWidget(label("Распознавание и команды выполняются на этом устройстве.", "muted", True))
+        self.recognition_description = label("Распознавание и команды выполняются на этом устройстве.", "muted", True)
+        layout.addWidget(self.recognition_description)
         row = QHBoxLayout()
         row.setSpacing(18)
         hero = panel("heroCard")
@@ -422,6 +431,45 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 8, 0)
         layout.setSpacing(16)
         layout.addWidget(label("Настроено под тебя.", "heroSmall"))
+        recognition = panel()
+        rf = QFormLayout(recognition)
+        rf.setContentsMargins(24, 24, 24, 24)
+        rf.addRow(label("РАСПОЗНАВАНИЕ КОМАНД", "eyebrow"))
+        self.recognition_backend = QComboBox()
+        self.recognition_backend.addItem("Офлайн · на этом компьютере", "offline")
+        self.recognition_backend.addItem("Google Gemini · лучше понимает речь", "gemini")
+        self.recognition_backend.setCurrentIndex(max(0, self.recognition_backend.findData(self.settings.get("recognition_backend", "offline"))))
+        rf.addRow("Режим распознавания", self.recognition_backend)
+        self.gemini_key = QLineEdit()
+        self.gemini_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.gemini_key.setPlaceholderText("Вставьте свой ключ из Google AI Studio")
+        rf.addRow("API-ключ Google", self.gemini_key)
+        key_buttons = QHBoxLayout()
+        self.save_key_button = button("Сохранить ключ", self.save_cloud_key)
+        self.forget_key_button = button("Удалить ключ", self.forget_cloud_key)
+        key_buttons.addWidget(self.save_key_button)
+        key_buttons.addWidget(self.forget_key_button)
+        rf.addRow(key_buttons)
+        self.key_status = label("Ключ не сохранён.", "tiny", True)
+        rf.addRow(self.key_status)
+        self.recognition_note = label("", "muted", True)
+        rf.addRow(self.recognition_note)
+        rf.addRow(label("Google получает короткую команду после распознанного имени, до 12 секунд, и список названий/фраз команд. Бесплатный тариф имеет квоты; Google может использовать отправленное содержимое для улучшения продуктов. Полностью локальная работа доступна в офлайн-режиме.", "tiny", True))
+        self.speech_threshold = QDoubleSpinBox()
+        self.speech_threshold.setRange(.0005, .1)
+        self.speech_threshold.setDecimals(4)
+        self.speech_threshold.setSingleStep(.001)
+        self.speech_threshold.setValue(float(self.settings.get("speech_threshold", .004)))
+        self.speech_threshold.setToolTip("Больше значение — сильнее отсеиваются тихие фоновые звуки. Меньше — легче услышать тихую речь.")
+        rf.addRow("Порог громкости микрофона", self.speech_threshold)
+        self.recognition_confidence = QSpinBox()
+        self.recognition_confidence.setRange(50, 99)
+        self.recognition_confidence.setSuffix(" %")
+        self.recognition_confidence.setValue(round(float(self.settings.get("min_recognition_confidence", .72)) * 100))
+        self.recognition_confidence.setToolTip("Минимальная уверенность локального распознавания. Выше — меньше случайных команд, но чаще нужно повторять.")
+        rf.addRow("Уверенность распознавания", self.recognition_confidence)
+        rf.addRow(label("Если мешает фон, увеличьте порог шума. Если тихий голос пропускается, немного уменьшите. Во время ответа помощник не слушает себя.", "tiny", True))
+        layout.addWidget(recognition)
         voice = panel()
         form = QFormLayout(voice)
         form.setContentsMargins(24, 24, 24, 24)
@@ -431,7 +479,7 @@ class MainWindow(QMainWindow):
         self.require_wake = QCheckBox("Слушать команды только после имени")
         self.require_wake.setChecked(self.settings["require_wake_word"])
         form.addRow(self.require_wake)
-        self.spoken = QCheckBox("Озвучивать ответы системным голосом")
+        self.spoken = QCheckBox("Озвучивать ответы выбранным голосом")
         self.spoken.setChecked(self.settings["spoken_replies"])
         form.addRow(self.spoken)
         from jarvis.voice_profiles import VOICE_MODES, voice_assets
@@ -488,7 +536,7 @@ class MainWindow(QMainWindow):
         self.download_button = button("Скачать модель · 45 МБ", self.download_model)
         row.addWidget(self.download_button)
         ml.addLayout(row)
-        ml.addWidget(label("Загрузка — единственное сетевое действие помощника. Можно перенести модель с другого ПК. В готовых сборках модель уже есть.", "tiny", True))
+        ml.addWidget(label("Модель нужна для офлайн-команд и проверки имени перед отправкой команды в Google. Можно перенести её с другого ПК. В готовых сборках модель уже есть.", "tiny", True))
         layout.addWidget(model)
         look = panel()
         form = QFormLayout(look)
@@ -505,9 +553,64 @@ class MainWindow(QMainWindow):
         layout.addWidget(look)
         layout.addWidget(button("Сохранить настройки", self.save_settings, "primary"))
         layout.addWidget(button("Открыть папку данных", lambda: self.executor.execute([validate_command(dict(title="Папка данных", phrases=["данные"], actions=[dict(type="open_folder", value=str(self.store.root))]))], __import__("threading").Event())))
-        layout.addWidget(label("Никаких аккаунтов, API-ключей и телеметрии.\nМикрофон выключен при старте. Записи звука не сохраняются.", "muted", True))
+        layout.addWidget(label("Офлайн-режим работает без аккаунта и ключа. Google подключается по вашему выбору.\nМикрофон выключен при старте. Приложение не сохраняет записи звука; ключ хранится отдельно от настроек.", "muted", True))
         layout.addStretch()
         self.pages.addWidget(scroll(content))
+        self.recognition_backend.currentIndexChanged.connect(self.update_recognition_controls)
+        self.update_recognition_controls()
+
+    def update_recognition_controls(self):
+        online = self.recognition_backend.currentData() == "gemini"
+        self.gemini_key.setEnabled(online)
+        self.save_key_button.setEnabled(online)
+        self.forget_key_button.setEnabled(online)
+        if online:
+            if self.require_wake.isEnabled():
+                self._offline_require_wake = self.require_wake.isChecked()
+            self.require_wake.setChecked(True)
+        elif not self.require_wake.isEnabled():
+            self.require_wake.setChecked(self._offline_require_wake)
+        self.require_wake.setEnabled(not online)
+        self.require_wake.setText("Google всегда слушает команды только после имени" if online else "Слушать команды только после имени")
+        self.recognition_note.setText(
+            "Короткие голосовые команды распознаёт Gemini; действия выполняются на ПК. Имя помощника обязательно. Для применения нажмите «Сохранить настройки»."
+            if online else "Распознавание работает на ПК без интернета. Для применения нажмите «Сохранить настройки».")
+
+    def refresh_recognition_status(self):
+        configured = has_gemini_key()
+        self.key_status.setText("Ключ сохранён в папке данных пользователя." if configured else "Ключ не сохранён. Получите бесплатный ключ в Google AI Studio.")
+        if self.settings.get("recognition_backend", "offline") == "gemini":
+            self.recognition_chip.setText("●  GOOGLE" if configured else "●  НУЖЕН КЛЮЧ")
+            self.recognition_description.setText("Google распознаёт короткие команды после имени помощника. Действия выполняются на этом компьютере.")
+        else:
+            self.recognition_chip.setText("●  ОФЛАЙН")
+            self.recognition_description.setText("Распознавание и команды выполняются на этом устройстве.")
+
+    def save_cloud_key(self):
+        if self.listener and self.listener.isRunning():
+            self.status_label.setText("Выключите микрофон перед изменением ключа.")
+            return
+        try:
+            save_gemini_key(self.gemini_key.text())
+        except CredentialsError as exc:
+            self.status_label.setText(str(exc))
+            return
+        self.gemini_key.clear()
+        self.refresh_recognition_status()
+        self.status_label.setText("Ключ сохранён. Google готов к распознаванию." if self.settings.get("recognition_backend") == "gemini" else "Ключ сохранён. Выберите Google и сохраните настройки, чтобы включить его.")
+
+    def forget_cloud_key(self):
+        if self.listener and self.listener.isRunning():
+            self.status_label.setText("Выключите микрофон перед удалением ключа.")
+            return
+        try:
+            delete_gemini_key()
+        except CredentialsError as exc:
+            self.status_label.setText(str(exc))
+            return
+        self.gemini_key.clear()
+        self.refresh_recognition_status()
+        self.status_label.setText("Ключ удалён. Офлайн-режим доступен без ключа.")
 
     def apply_theme(self):
         accent = self.settings["accent"]
@@ -542,8 +645,8 @@ class MainWindow(QMainWindow):
             QPushButton#nav:checked {{ background: #303925; color: {accent}; }}
             QPushButton#quick {{ text-align: left; padding: 12px; background: #293022; }}
             QPushButton#smallButton {{ padding: 5px 12px; border-radius: 12px; min-height: 16px; }}
-            QLineEdit, QPlainTextEdit, QComboBox {{ background: #131710; border: 1px solid #414937; border-radius: 12px; padding: 11px; selection-background-color: #515d3e; }}
-            QLineEdit:focus, QPlainTextEdit:focus, QComboBox:focus {{ border: 1px solid {accent}; }}
+            QLineEdit, QPlainTextEdit, QComboBox, QDoubleSpinBox, QSpinBox {{ background: #131710; border: 1px solid #414937; border-radius: 12px; padding: 11px; selection-background-color: #515d3e; }}
+            QLineEdit:focus, QPlainTextEdit:focus, QComboBox:focus, QDoubleSpinBox:focus, QSpinBox:focus {{ border: 1px solid {accent}; }}
             QComboBox QAbstractItemView {{ background: #242b1e; selection-background-color: #455234; }}
             QCheckBox {{ background: transparent; spacing: 12px; padding: 5px 0; }}
             QCheckBox::indicator {{ width: 20px; height: 20px; border: 1px solid #5c674d; border-radius: 6px; background: #171c12; }}
@@ -561,7 +664,7 @@ class MainWindow(QMainWindow):
             replacements = {accent: "#ff8176", "#111310": "#0d0e12", "#191b17": "#15151b", "#1d211a": "#1b1b23", "#181c16": "#14141b", "#2b3026": "#3e292e", "#2a2d26": "#35232a", "#292f20": "#382128", "#303925": "#382128", "#2c3226": "#30242b", "#293022": "#30242b", "#131710": "#121219", "#414937": "#53323a", "#3b4432": "#48303a", "#4d583f": "#603a44", "#202817": "#250c10", "#eef6d7": "#ffb4aa", "#242b1e": "#28202a", "#46503b": "#70404b", "#b8bcb0": "#c4a0a7", "#adb2a5": "#b3a3aa"}
             for old, new in replacements.items():
                 sheet = sheet.replace(old, new)
-            sheet += "#card, #heroCard { border-radius: 12px; } QPushButton, QLineEdit, QComboBox { border-radius: 8px; } #brand { color: #ff8176; }"
+            sheet += "#card, #heroCard { border-radius: 12px; } QPushButton, QLineEdit, QComboBox, QDoubleSpinBox, QSpinBox { border-radius: 8px; } #brand { color: #ff8176; }"
             self.setStyleSheet(sheet)
             self.dots.accent = QColor("#ff8176")
             self.brand.setText("ULTRON")
@@ -743,12 +846,37 @@ class MainWindow(QMainWindow):
             self.listen_button.setEnabled(False)
             self.listen_button.setText("Останавливаю…")
             return
+        listener_settings = dict(self.settings)
+        enabled_commands = validate_collection([command for command in self.commands if command["enabled"]])
+        listener_settings["command_phrases"] = [phrase for command in enabled_commands for phrase in command["phrases"]]
+        self._cloud_recognizer = None
+        cloud_transcriber = None
+        if self.settings.get("recognition_backend", "offline") == "gemini":
+            try:
+                key = load_gemini_key()
+                if not key:
+                    self.navigate(3)
+                    self.refresh_recognition_status()
+                    self.status_label.setText("Сохраните API-ключ Google или выберите офлайн-режим.")
+                    return
+                self._cloud_recognizer = GeminiCommandRecognizer(key)
+            except CredentialsError as exc:
+                self.navigate(3)
+                self.status_label.setText(str(exc))
+                return
+            client = self._cloud_recognizer
+            wake = self.settings["wake_word"]
+            listener_settings["require_wake_word"] = True
+            def cloud_transcriber(pcm, sample_rate, local_text):
+                return client.recognize(pcm, sample_rate, local_text, enabled_commands, wake)
         model = find_model(self.settings, self.store.root)
         if not model:
+            self._cloud_recognizer = None
             self.navigate(3)
             self.status_label.setText("Выберите или загрузите модель. Без модели доступны команды текстом и кнопками.")
             return
-        self.listener = Listener(model, self.settings["microphone"], self.speaker.active)
+        self.listener = Listener(model, self.settings["microphone"], self.speaker.active,
+                                 settings=listener_settings, cloud_transcriber=cloud_transcriber)
         self.listener.recognized.connect(self.handle_phrase)
         self.listener.partial.connect(lambda text: self.voice_text.setText(text or "Слушаю…"))
         self.listener.state.connect(self.status_label.setText)
@@ -766,6 +894,9 @@ class MainWindow(QMainWindow):
         self.dots.level = value
 
     def listening_stopped(self):
+        if self.listener:
+            self.listener.cloud_transcriber = None
+        self._cloud_recognizer = None
         self.dots.listening = False
         self.listen_button.setEnabled(True)
         self.listen_button.setText("●  Включить микрофон")
@@ -804,17 +935,22 @@ class MainWindow(QMainWindow):
         if not self.wake.text().strip():
             self.status_label.setText("Введите имя помощника.")
             return
-        self.settings.update(wake_word=self.wake.text().strip(), require_wake_word=self.require_wake.isChecked(),
+        self.settings.update(wake_word=self.wake.text().strip(),
+            require_wake_word=self._offline_require_wake if self.recognition_backend.currentData() == "gemini" else self.require_wake.isChecked(),
             spoken_replies=self.spoken.isChecked(), voice_mode=self.voice_modes.currentData(), model_path=self.model_path.text().strip(),
             microphone=self.microphones.currentData(), accent=self.accents.currentData(), close_to_tray=self.close_to_tray.isChecked())
         self.settings.update(use_voice_pack=self.use_pack.isChecked(), clone_enabled=self.clone_enabled.isChecked(),
             clone_python=self.clone_python.text().strip(), clone_model=self.clone_model.text().strip())
+        self.settings.update(recognition_backend=self.recognition_backend.currentData(),
+            speech_threshold=self.speech_threshold.value(),
+            min_recognition_confidence=self.recognition_confidence.value() / 100)
         self.store.write("settings.json", self.settings)
         self.speaker.enabled = self.settings["spoken_replies"] and not self.test_mode
         self.speaker.mode = self.settings["voice_mode"]
         self.configure_speaker()
         self.apply_theme()
         self.refresh_model()
+        self.refresh_recognition_status()
         self.status_label.setText("Настройки сохранены.")
 
     def preview_voice(self):

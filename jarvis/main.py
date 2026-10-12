@@ -37,6 +37,11 @@ def main():
     if args.smoke_test:
         def check():
             try:
+                # Exercise the native VAD extension in portable builds without
+                # opening the user's microphone or making any network request.
+                from jarvis.audio_gate import SpeechGate
+                gate = SpeechGate()
+                assert not any(event.utterance for event in gate.feed(bytes(32000)))
                 window.handle_phrase("который час", voice=False)
                 QTimer.singleShot(600, verify)
             except Exception:
