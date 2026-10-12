@@ -45,6 +45,8 @@ jobs:
         run: xvfb-run -a python -m jarvis --smoke-test --screenshot build/source.png
       - name: Build native portable bundle
         run: python scripts/build.py --with-model
+      - name: Include demo video
+        run: python -c "import shutil; shutil.copy2('docs/video/JarvisDot-Demo.mp4', 'dist/JarvisDot-Demo.mp4')"
       - name: Bundle smoke test (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -60,6 +62,7 @@ jobs:
           path: |
             dist/*.zip
             dist/*.tar.gz
+            dist/*.mp4
           if-no-files-found: error
       - uses: actions/upload-artifact@v4
         with:

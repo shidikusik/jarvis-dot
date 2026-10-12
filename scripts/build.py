@@ -19,6 +19,8 @@ def main():
     command = [sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "--windowed",
                "--name", "JarvisDot", "--paths", str(ROOT), "--collect-all", "vosk",
                "--collect-all", "sounddevice", "--collect-submodules", "pyttsx3.drivers"]
+    if sys.platform == "win32":
+        command += ["--icon", str(ROOT/"assets/app.ico")]
     if args.with_model:
         source = ROOT / "models" / MODEL_NAME
         if not valid_model(source):

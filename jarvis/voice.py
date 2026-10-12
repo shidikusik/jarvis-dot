@@ -9,14 +9,18 @@ import subprocess
 import sys
 import threading
 import tempfile
+import time
+import os
+import signal
 
 from PySide6.QtCore import QThread, Signal
 
 
 class Speaker:
     """Isolate platform speech drivers from the GUI and recognition threads."""
-    def __init__(self, error=lambda message: None):
+    def __init__(self, error=lambda message: None, status=lambda message: None):
         self.error = error
+        self.status = status
         self.enabled = True
         self.mode = "jarvis"
         self.use_pack = True
@@ -45,23 +49,40 @@ class Speaker:
                 payload_data = self._queue.get(timeout=.2)
             except queue.Empty:
                 continue
-            self.active.set()
             try:
                 with tempfile.TemporaryDirectory(prefix="jarvis-speech-") as temporary:
                     payload = Path(temporary) / "speech.json"
+                    playing = Path(temporary) / "playing.flag"
+                    payload_data["playing_flag"] = str(playing)
+                    self.status("Готовлю голос локально…" + (" Перенос новой фразы на CPU может занять около минуты." if payload_data["clone_enabled"] else ""))
                     payload.write_text(json.dumps(payload_data, ensure_ascii=False), encoding="utf-8")
                     args = [sys.executable, "--tts"] if getattr(sys, "frozen", False) else [sys.executable, "-m", "jarvis", "--tts"]
                     args += ["--speech-file", str(payload)]
                     self._process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+                        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+                        start_new_session=sys.platform != "win32")
+                    process = self._process
+                    def watch_playback():
+                        while process.poll() is None and not self._closing.is_set():
+                            if playing.exists():
+                                self.active.set()
+                            else:
+                                self.active.clear()
+                            time.sleep(.05)
+                    watcher = threading.Thread(target=watch_playback, daemon=True)
+                    watcher.start()
                     _, errors = self._process.communicate(timeout=180 if self.clone_enabled else 55)
+                    watcher.join(timeout=1)
                     if self._process.returncode:
                         self.error(errors.decode("utf-8", errors="replace")[-500:] or "Голосовой движок недоступен")
+                    else:
+                        self.status("Озвучивание завершено.")
             except Exception as exc:
                 if self._process and self._process.poll() is None:
-                    self._process.kill()
+                    self._terminate(self._process)
                     self._process.communicate()
-                self.error(f"Озвучивание: {exc}")
+                if not self._closing.is_set():
+                    self.error(f"Озвучивание: {exc}")
             finally:
                 self._process = None
                 self.active.clear()
@@ -69,8 +90,20 @@ class Speaker:
     def close(self):
         self._closing.set()
         if self._process and self._process.poll() is None:
-            self._process.terminate()
+            self._terminate(self._process)
         self._worker.join(timeout=2)
+
+    @staticmethod
+    def _terminate(process):
+        if sys.platform == "win32":
+            subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5,
+                creationflags=subprocess.CREATE_NO_WINDOW)
+        else:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
 
 
 class Listener(QThread):
@@ -139,6 +172,17 @@ class Listener(QThread):
 def speak_process(payload_path):
     payload = json.loads(Path(payload_path).read_text(encoding="utf-8"))
     text, mode = payload["text"], payload.get("mode", "jarvis")
+    playing = Path(payload["playing_flag"]) if payload.get("playing_flag") else None
+    def play(audio, rate):
+        import sounddevice as sd
+        try:
+            if playing:
+                playing.touch()
+            sd.play(audio, rate)
+            sd.wait()
+        finally:
+            if playing:
+                playing.unlink(missing_ok=True)
     from jarvis.voice_profiles import voice_assets, synthesize, read_wav, process_voice
     from jarvis.packs import recorded_reply, pack_root
     clip = recorded_reply(text) if payload.get("use_pack", True) else None
@@ -147,8 +191,7 @@ def speak_process(payload_path):
         audio, rate = read_wav(clip)
         if mode == "ultron":
             audio = process_voice(audio, rate, mode)
-        sd.play(audio, rate)
-        sd.wait()
+        play(audio, rate)
         return
     if voice_assets():
         import sounddevice as sd
@@ -161,8 +204,7 @@ def speak_process(payload_path):
                     audio = process_voice(audio, rate, mode)
             else:
                 audio, rate = synthesize(text, mode, Path(temporary)/"reply.wav")
-            sd.play(audio, rate)
-            sd.wait()
+            play(audio, rate)
         return
     import pyttsx3
     engine = pyttsx3.init()
@@ -171,5 +213,11 @@ def speak_process(payload_path):
     if russian:
         engine.setProperty("voice", russian.id)
     engine.setProperty("rate", 175)
-    engine.say(text)
-    engine.runAndWait()
+    try:
+        if playing:
+            playing.touch()
+        engine.say(text)
+        engine.runAndWait()
+    finally:
+        if playing:
+            playing.unlink(missing_ok=True)

@@ -33,7 +33,9 @@ def main():
     model = ChatterboxVC.from_local(args.model, device=device)
     wav = model.generate(str(args.input), target_voice_path=str(args.reference))
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    sf.write(str(args.output), wav.squeeze().numpy(), model.sr, subtype="PCM_16")
+    staging = args.output.with_suffix(".tmp.wav")
+    sf.write(str(staging), wav.squeeze().numpy(), model.sr, subtype="PCM_16")
+    staging.replace(args.output)
     print(f"Local voice conversion: {device}, {time.monotonic()-started:.1f}s, {args.output}", flush=True)
 
 

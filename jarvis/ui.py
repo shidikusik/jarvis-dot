@@ -217,6 +217,7 @@ class CommandEditor(QDialog):
 
 class MainWindow(QMainWindow):
     speech_error = Signal(str)
+    speech_state = Signal(str)
 
     def __init__(self, store=None, test_mode=False):
         super().__init__()
@@ -227,7 +228,7 @@ class MainWindow(QMainWindow):
         self.listener = self.runner = self.downloader = None
         self._quitting = False
         self.pending_phrase = ""
-        self.speaker = Speaker(self.speech_error.emit)
+        self.speaker = Speaker(self.speech_error.emit, self.speech_state.emit)
         self.speaker.enabled = self.settings["spoken_replies"] and not test_mode
         self.speaker.mode = self.settings["voice_mode"]
         self.configure_speaker()
@@ -241,6 +242,7 @@ class MainWindow(QMainWindow):
         self.apply_theme()
         self.setup_tray()
         self.speech_error.connect(lambda message: self.status_label.setText(message))
+        self.speech_state.connect(self.status_label.setText)
         self.refresh_commands()
         self.refresh_history()
         self.refresh_model()
