@@ -19,6 +19,10 @@ class Speaker:
         self.error = error
         self.enabled = True
         self.mode = "jarvis"
+        self.use_pack = True
+        self.clone_python = ""
+        self.clone_model = ""
+        self.clone_enabled = False
         self.active = threading.Event()
         self._queue = queue.Queue(maxsize=8)
         self._closing = threading.Event()
@@ -26,29 +30,31 @@ class Speaker:
         self._worker = threading.Thread(target=self._run, daemon=True)
         self._worker.start()
 
-    def say(self, text):
-        if self.enabled and not self._closing.is_set():
+    def say(self, text, force=False, use_pack=None):
+        if (self.enabled or force) and not self._closing.is_set():
             try:
-                self._queue.put_nowait(text)
+                self._queue.put_nowait(dict(text=text, mode=self.mode,
+                    use_pack=self.use_pack if use_pack is None else use_pack,
+                    clone_python=self.clone_python, clone_model=self.clone_model, clone_enabled=self.clone_enabled))
             except queue.Full:
                 pass
 
     def _run(self):
         while not self._closing.is_set():
             try:
-                text = self._queue.get(timeout=.2)
+                payload_data = self._queue.get(timeout=.2)
             except queue.Empty:
                 continue
             self.active.set()
             try:
                 with tempfile.TemporaryDirectory(prefix="jarvis-speech-") as temporary:
                     payload = Path(temporary) / "speech.json"
-                    payload.write_text(json.dumps(dict(text=text, mode=self.mode), ensure_ascii=False), encoding="utf-8")
+                    payload.write_text(json.dumps(payload_data, ensure_ascii=False), encoding="utf-8")
                     args = [sys.executable, "--tts"] if getattr(sys, "frozen", False) else [sys.executable, "-m", "jarvis", "--tts"]
                     args += ["--speech-file", str(payload)]
                     self._process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                         creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
-                    _, errors = self._process.communicate(timeout=55)
+                    _, errors = self._process.communicate(timeout=180 if self.clone_enabled else 55)
                     if self._process.returncode:
                         self.error(errors.decode("utf-8", errors="replace")[-500:] or "Голосовой движок недоступен")
             except Exception as exc:
@@ -133,11 +139,28 @@ class Listener(QThread):
 def speak_process(payload_path):
     payload = json.loads(Path(payload_path).read_text(encoding="utf-8"))
     text, mode = payload["text"], payload.get("mode", "jarvis")
-    from jarvis.voice_profiles import voice_assets, synthesize
+    from jarvis.voice_profiles import voice_assets, synthesize, read_wav, process_voice
+    from jarvis.packs import recorded_reply, pack_root
+    clip = recorded_reply(text) if payload.get("use_pack", True) else None
+    if clip:
+        import sounddevice as sd
+        audio, rate = read_wav(clip)
+        if mode == "ultron":
+            audio = process_voice(audio, rate, mode)
+        sd.play(audio, rate)
+        sd.wait()
+        return
     if voice_assets():
         import sounddevice as sd
         with tempfile.TemporaryDirectory(prefix="jarvis-audio-") as temporary:
-            audio, rate = synthesize(text, mode, Path(temporary)/"reply.wav")
+            if payload.get("clone_enabled") and payload.get("clone_python") and payload.get("clone_model"):
+                from jarvis.clone_bridge import clone_reply
+                path = clone_reply(text, payload, Path(temporary))
+                audio, rate = read_wav(path)
+                if mode == "ultron":
+                    audio = process_voice(audio, rate, mode)
+            else:
+                audio, rate = synthesize(text, mode, Path(temporary)/"reply.wav")
             sd.play(audio, rate)
             sd.wait()
         return

@@ -230,6 +230,7 @@ class MainWindow(QMainWindow):
         self.speaker = Speaker(self.speech_error.emit)
         self.speaker.enabled = self.settings["spoken_replies"] and not test_mode
         self.speaker.mode = self.settings["voice_mode"]
+        self.configure_speaker()
         self.executor = Executor(self.store.root, self.speaker.say)
         self.setWindowTitle("JARVIS DOT · Offline assistant")
         self.resize(1180, 820)
@@ -440,6 +441,10 @@ class MainWindow(QMainWindow):
         self.voice_modes.currentIndexChanged.connect(lambda: self.switch_persona(self.voice_modes.currentData()))
         form.addRow(button("Послушать выбранный голос", self.preview_voice))
         form.addRow(label("Мужской нейроголос + обработка. " + ("Нейромодель установлена." if voice_assets() else "Пока доступен только системный голос. Установите нейромодель из README."), "tiny", True))
+        self.use_pack = QCheckBox("Оригинальные короткие ответы из твоего пака")
+        self.use_pack.setChecked(self.settings["use_voice_pack"])
+        form.addRow(self.use_pack)
+        form.addRow(button("Послушать оригинальную запись", self.preview_recording))
         self.microphones = QComboBox()
         self.microphones.addItem("Системный микрофон", None)
         try:
@@ -452,6 +457,21 @@ class MainWindow(QMainWindow):
         self.microphones.setCurrentIndex(max(0, self.microphones.findData(self.settings["microphone"])))
         form.addRow("Устройство ввода", self.microphones)
         layout.addWidget(voice)
+        clone = panel()
+        cf = QFormLayout(clone)
+        cf.setContentsMargins(24, 24, 24, 24)
+        cf.addRow(label("ПЕРЕНОС ГОЛОСА ИЗ ПАКА · ЛОКАЛЬНО", "eyebrow"))
+        self.clone_enabled = QCheckBox("Синтезировать новые фразы с тембром из пака")
+        self.clone_enabled.setChecked(self.settings["clone_enabled"])
+        cf.addRow(self.clone_enabled)
+        self.clone_python = QLineEdit(self.settings["clone_python"])
+        self.clone_python.setPlaceholderText(".voice-venv/Scripts/python.exe или .voice-venv/bin/python")
+        cf.addRow("Python движка", self.clone_python)
+        self.clone_model = QLineEdit(self.settings["clone_model"])
+        self.clone_model.setPlaceholderText("Папка с s3gen.safetensors")
+        cf.addRow("Модель переноса", self.clone_model)
+        cf.addRow(label("Дополнительный движок требует отдельной установки. Первый новый ответ медленнее обычного; ответы кешируются. Все вычисления и образец остаются на ПК.", "tiny", True))
+        layout.addWidget(clone)
         model = panel()
         ml = QVBoxLayout(model)
         ml.setContentsMargins(24, 24, 24, 24)
@@ -704,6 +724,8 @@ class MainWindow(QMainWindow):
         self.store.record(dict(time=datetime.now().astimezone().isoformat(timespec="seconds"), phrase=self.pending_phrase, ok=ok, message=message))
         self.refresh_history()
         self.stop_button.setVisible(False)
+        if ok and self.runner and not any(a["type"] in {"time", "speak"} for c in self.runner.commands for a in c["actions"]):
+            self.speaker.say("Запрос выполнен, сэр")
 
     def run_thread_finished(self):
         if self.listener:
@@ -735,6 +757,8 @@ class MainWindow(QMainWindow):
         self.dots.listening = True
         self.listen_button.setText("■  Выключить микрофон")
         self.voice_badge.setText("МИКРОФОН ВКЛ")
+        if self.tray:
+            self.tray.setToolTip("JARVIS DOT · микрофон включён")
 
     def voice_level(self, value):
         self.dots.level = value
@@ -744,6 +768,8 @@ class MainWindow(QMainWindow):
         self.listen_button.setEnabled(True)
         self.listen_button.setText("●  Включить микрофон")
         self.voice_badge.setText("ОЖИДАНИЕ")
+        if self.tray:
+            self.tray.setToolTip("JARVIS DOT · микрофон выключен")
 
     def refresh_model(self):
         model = find_model(self.settings, self.store.root)
@@ -779,18 +805,29 @@ class MainWindow(QMainWindow):
         self.settings.update(wake_word=self.wake.text().strip(), require_wake_word=self.require_wake.isChecked(),
             spoken_replies=self.spoken.isChecked(), voice_mode=self.voice_modes.currentData(), model_path=self.model_path.text().strip(),
             microphone=self.microphones.currentData(), accent=self.accents.currentData(), close_to_tray=self.close_to_tray.isChecked())
+        self.settings.update(use_voice_pack=self.use_pack.isChecked(), clone_enabled=self.clone_enabled.isChecked(),
+            clone_python=self.clone_python.text().strip(), clone_model=self.clone_model.text().strip())
         self.store.write("settings.json", self.settings)
         self.speaker.enabled = self.settings["spoken_replies"] and not self.test_mode
         self.speaker.mode = self.settings["voice_mode"]
+        self.configure_speaker()
         self.apply_theme()
         self.refresh_model()
         self.status_label.setText("Настройки сохранены.")
 
     def preview_voice(self):
         self.speaker.mode = self.voice_modes.currentData()
-        self.speaker.enabled = True
         phrase = "Добрый вечер. Все системы готовы. Ожидаю ваших команд." if self.speaker.mode == "jarvis" else "Я на связи. Системы под моим контролем. Назови свою команду."
-        self.speaker.say(phrase)
+        self.speaker.say(phrase, force=True)
+
+    def configure_speaker(self):
+        self.speaker.use_pack = self.settings["use_voice_pack"]
+        self.speaker.clone_enabled = self.settings["clone_enabled"]
+        self.speaker.clone_python = self.settings["clone_python"]
+        self.speaker.clone_model = self.settings["clone_model"]
+
+    def preview_recording(self):
+        self.speaker.say("К вашим услугам, сэр", force=True, use_pack=True)
 
     def setup_tray(self):
         self.tray = None

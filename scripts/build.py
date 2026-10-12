@@ -29,8 +29,15 @@ def main():
             raise SystemExit("Run python scripts/download_voices.py first")
         command += ["--add-data", f"{voice}:models/voice"]
     command += [str(ROOT / "run.py")]
+    command += ["--add-data", f"{ROOT / 'assets'}:assets", "--add-data", f"{ROOT / 'scripts/clone_voice.py'}:scripts"]
     subprocess.run(command, cwd=ROOT, check=True)
     bundle = ROOT / "dist/JarvisDot"
+    if sys.platform == "win32":
+        # Qt 6.12 imports Windows' unversioned ICU API. A Git installation on PATH
+        # can make PyInstaller collect ICU 78 with incompatible suffixed exports.
+        # Use the OS ICU provided by supported Windows 10/11 installations.
+        for name in ("icuuc.dll", "icudt78.dll"):
+            (bundle / "_internal" / name).unlink(missing_ok=True)
     shutil.copy2(ROOT / "README.md", bundle / "README.md")
     shutil.copy2(ROOT / "LICENSE", bundle / "LICENSE")
     shutil.copy2(ROOT / "THIRD_PARTY.md", bundle / "THIRD_PARTY.md")
