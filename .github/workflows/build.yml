@@ -1,0 +1,85 @@
+name: Native builds
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-22.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Linux desktop libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libportaudio2 espeak-ng libespeak1 libegl1 libgl1 libxcb-cursor0 libxkbcommon-x11-0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-render-util0 xvfb
+      - run: python -m pip install -r requirements-dev.txt
+      - run: python -m pytest -q
+      - name: Download verified offline model
+        run: |
+          python scripts/download_model.py
+          python scripts/download_voices.py
+      - name: Offline speech and recognition check
+        run: python scripts/check_speech.py
+      - name: Source GUI smoke test (Windows)
+        if: runner.os == 'Windows'
+        run: python -m jarvis --smoke-test --screenshot build/source.png
+      - name: Source GUI smoke test (Linux)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a python -m jarvis --smoke-test --screenshot build/source.png
+      - name: Build native portable bundle
+        run: python scripts/build.py --with-model
+      - name: Bundle smoke test (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath dist/JarvisDot/JarvisDot.exe -ArgumentList '--smoke-test','--screenshot','build/bundle.png' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "Bundle smoke test failed: $($p.ExitCode)" }
+      - name: Bundle smoke test (Linux)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a dist/JarvisDot/JarvisDot --smoke-test --screenshot build/bundle.png
+      - uses: actions/upload-artifact@v4
+        with:
+          name: JarvisDot-${{ runner.os }}-x64
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: QA-${{ runner.os }}
+          path: build/*.png
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: JarvisDot-*
+          merge-multiple: true
+          path: release
+      - name: Publish native archives
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$RELEASE_TAG" release/* --title "JARVIS DOT $RELEASE_TAG" --notes "Native offline voice assistant for Windows and Linux. Russian speech model included. Extract the full archive and run JarvisDot.exe on Windows or start.sh on Linux. See README for Linux runtime dependencies and supported platforms." --verify-tag

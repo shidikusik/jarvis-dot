@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+build/
+dist/
+models/
+.tools/
+*.spec
+*.log
+.env
+*.zip
+*.tar.gz
