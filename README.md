@@ -6,6 +6,8 @@ Nothing OS + Material You: точечная анимация, тёмные по�
 
 ![Главное окно](docs/screenshots/assistant.png)
 
+![Режим Ultron](docs/screenshots/ultron.png)
+
 ## Возможности
 
 - Русское распознавание речи на устройстве — Vosk. Микрофон включается кнопкой; по умолчанию нужна фраза «Джарвис».
@@ -50,7 +52,8 @@ Python 3.11–3.13 (CI: 3.12). Первичная установка завис�
 # Debian / Ubuntu / Mint
 sudo apt install python3-venv libportaudio2 espeak-ng libespeak1 \
   libegl1 libgl1 libxcb-cursor0 libxkbcommon-x11-0 libxcb-icccm4 \
-  libxcb-image0 libxcb-keysyms1 libxcb-render-util0 playerctl pulseaudio-utils
+  libxcb-image0 libxcb-keysyms1 libxcb-render-util0 libxcb-xinput0 \
+  libxcb-shape0 libxcb-xfixes0 libxcb-randr0 libxcb-sync1 playerctl pulseaudio-utils
 
 # Fedora
 sudo dnf install python3 portaudio espeak-ng libglvnd-egl libglvnd-glx \
@@ -74,6 +77,8 @@ sh start-linux.sh
 2. Нажмите «Включить микрофон» и скажите: **«Джарвис, который час»**.
 3. В «Командах» создайте свой сценарий. Пути приложений задаются отдельно для каждой ОС.
 4. В «Настройках» выберите микрофон, имя, режим Jarvis/Ultron и цвет. Нейроголос встроен в готовые сборки и не зависит от установленного системного голоса.
+
+Имя активации по умолчанию — «Джарвис» в обоих режимах; переключение характера не меняет ваши фразы. Редкие пользовательские имена маленькая модель может распознавать неточно. Если меняете имя, сначала проверьте его в строке распознавания.
 
 Модель: `vosk-model-small-ru-0.22` (~45 МБ). Если она отсутствует, выберите распакованную папку в настройках или нажмите «Скачать модель». Загрузка проверяет SHA-256, путь распаковки и размер архива.
 

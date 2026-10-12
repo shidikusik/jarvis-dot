@@ -555,9 +555,6 @@ class MainWindow(QMainWindow):
         if mode not in {"jarvis", "ultron"}:
             return
         self.settings["voice_mode"] = mode
-        if self.settings["wake_word"].casefold() in {"джарвис", "альтрон"}:
-            self.settings["wake_word"] = "альтрон" if mode == "ultron" else "джарвис"
-            self.wake.setText(self.settings["wake_word"])
         self.voice_text.setText(f"«{self.settings['wake_word'].capitalize()}, который час?»")
         self.speaker.mode = mode
         for combo in (self.persona_switch, self.voice_modes):
